@@ -61,6 +61,17 @@ pub const TlsTransport = struct {
     /// fieldParentPtr back to *Client) stay valid for the transport's
     /// lifetime.
     tls_client: *std.crypto.tls.Client,
+    /// The TLS client's own cleartext buffers. They must not be the inner
+    /// transport's: that one holds the ciphertext going in and out, and
+    /// sharing it, the two overwrite each other once records get longer
+    /// than the handshake's.
+    clear_read: []u8,
+    clear_write: []u8,
+    /// What the Client writes through. std's tls.Client flush only seals
+    /// the buffered cleartext into the inner writer's buffer; it does not
+    /// flush the inner writer, so a request would sit there unsent. This
+    /// writer's flush goes through both, as std.http.Client does.
+    out: Io.Writer = .{ .vtable = &out_vtable, .buffer = &.{} },
     closed: bool = false,
     read_timeout_ms: ?u32 = null,
     write_timeout_ms: ?u32 = null,
@@ -84,6 +95,12 @@ pub const TlsTransport = struct {
         if (inner.read_buf.len < std.crypto.tls.Client.min_buffer_len) return error.InsufficientBuffer;
         if (inner.write_buf.len < std.crypto.tls.Client.min_buffer_len) return error.InsufficientBuffer;
 
+        const min = std.crypto.tls.Client.min_buffer_len;
+        const clear_read = try allocator.alloc(u8, @max(opts.encrypted_read_buffer_size, min));
+        errdefer allocator.free(clear_read);
+        const clear_write = try allocator.alloc(u8, @max(opts.encrypted_write_buffer_size, min));
+        errdefer allocator.free(clear_write);
+
         var ca_bundle_ptr: ?*std.crypto.Certificate.Bundle = null;
         var lock_ptr: ?*std.Io.RwLock = null;
         errdefer if (ca_bundle_ptr) |b| {
@@ -94,7 +111,7 @@ pub const TlsTransport = struct {
 
         const tls_opts: std.crypto.tls.Client.Options = blk: {
             var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
-            std.crypto.random.bytes(&entropy);
+            io.random(&entropy);
             const realtime: std.Io.Timestamp = std.Io.Clock.now(.real, io);
 
             // Note: we duplicate the entropy onto the stack here; the
@@ -104,15 +121,21 @@ pub const TlsTransport = struct {
                 .insecure => break :blk .{
                     .host = .no_verification,
                     .ca = .no_verification,
-                    .write_buffer = inner.write_buf,
-                    .read_buffer = inner.read_buf,
+                    .write_buffer = clear_write,
+                    .read_buffer = clear_read,
                     .entropy = &entropy,
                     .realtime_now = realtime,
                 },
                 .system_ca => {
                     ca_bundle_ptr = try allocator.create(std.crypto.Certificate.Bundle);
-                    ca_bundle_ptr.?.* = .{};
-                    try ca_bundle_ptr.?.rescan(allocator, io);
+                    ca_bundle_ptr.?.* = .empty;
+                    // A system CA bundle that cannot be read is a TLS setup
+                    // failure for the caller, whatever the file error was.
+                    ca_bundle_ptr.?.rescan(allocator, io, realtime) catch |e| switch (e) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.Canceled => return error.Canceled,
+                        else => return error.TlsHandshakeFailed,
+                    };
                     lock_ptr = try allocator.create(std.Io.RwLock);
                     lock_ptr.?.* = .init;
                     break :blk .{
@@ -123,8 +146,8 @@ pub const TlsTransport = struct {
                             .lock = lock_ptr.?,
                             .bundle = ca_bundle_ptr.?,
                         } },
-                        .write_buffer = inner.write_buf,
-                        .read_buffer = inner.read_buf,
+                        .write_buffer = clear_write,
+                        .read_buffer = clear_read,
                         .entropy = &entropy,
                         .realtime_now = realtime,
                     };
@@ -150,6 +173,8 @@ pub const TlsTransport = struct {
             .ca_bundle = ca_bundle_ptr,
             .ca_lock = lock_ptr,
             .tls_client = tls_client,
+            .clear_read = clear_read,
+            .clear_write = clear_write,
         };
         return self;
     }
@@ -159,9 +184,12 @@ pub const TlsTransport = struct {
         self.closed = true;
         // Best-effort close-notify; ignore error since we're tearing down.
         self.tls_client.end() catch {};
+        self.inner.transport().writer().flush() catch {};
         self.inner.deinit();
         self.allocator.destroy(self.inner);
         self.allocator.destroy(self.tls_client);
+        self.allocator.free(self.clear_read);
+        self.allocator.free(self.clear_write);
         if (self.ca_bundle) |b| {
             b.deinit(self.allocator);
             self.allocator.destroy(b);
@@ -189,7 +217,33 @@ pub const TlsTransport = struct {
     }
     fn writerImpl(ptr: *anyopaque) *Io.Writer {
         const self: *TlsTransport = @ptrCast(@alignCast(ptr));
-        return &self.tls_client.writer;
+        return &self.out;
+    }
+
+    const out_vtable: Io.Writer.VTable = .{ .drain = outDrain, .flush = outFlush };
+
+    /// Unbuffered: everything goes straight into the TLS writer, which
+    /// buffers and seals records itself.
+    fn outDrain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *TlsTransport = @alignCast(@fieldParentPtr("out", w));
+        const tw = &self.tls_client.writer;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try tw.writeAll(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| {
+            try tw.writeAll(last);
+            n += last.len;
+        }
+        return n;
+    }
+
+    fn outFlush(w: *Io.Writer) Io.Writer.Error!void {
+        const self: *TlsTransport = @alignCast(@fieldParentPtr("out", w));
+        try self.tls_client.writer.flush();
+        try self.inner.transport().writer().flush();
     }
     fn closeImpl(ptr: *anyopaque) void {
         const self: *TlsTransport = @ptrCast(@alignCast(ptr));
@@ -214,3 +268,10 @@ pub const TlsTransport = struct {
         return self.inner.transport().lastWriteError();
     }
 };
+
+test "TlsTransport compiles" {
+    // Nothing else references these on the test path: without this, a
+    // std API change in the TLS path goes unnoticed until a caller links it.
+    std.testing.refAllDecls(TlsTransport);
+    _ = &TlsTransport.over;
+}
