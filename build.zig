@@ -54,9 +54,24 @@ pub fn build(b: *std.Build) void {
         .root_module = smoke_module,
     });
     const run_smoke = b.addRunArtifact(smoke);
-    if (b.args) |args| run_smoke.addArgs(args);
+    run_smoke.addPassthruArgs();
     const smoke_step = b.step("smoke", "Run smoke scenarios. Pass scenario via -- e.g. zig build smoke -- happy");
     smoke_step.dependOn(&run_smoke.step);
+
+    const smoke_async_module = b.createModule(.{
+        .root_source_file = b.path("tests/smoke_async.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    smoke_async_module.addImport("clickzig", clickzig_module);
+    const smoke_async = b.addExecutable(.{
+        .name = "smoke_async",
+        .root_module = smoke_async_module,
+    });
+    const run_smoke_async = b.addRunArtifact(smoke_async);
+    run_smoke_async.addPassthruArgs();
+    const smoke_async_step = b.step("smoke-async", "Run async/cancellation smoke scenarios (default: all)");
+    smoke_async_step.dependOn(&run_smoke_async.step);
 
     const smoke_compression_step = b.step("smoke-compression", "Run ClickHouse-backed compression smoke scenarios");
     const run_smoke_select_compression = b.addRunArtifact(smoke);
@@ -71,16 +86,33 @@ pub fn build(b: *std.Build) void {
 
     const smoke_readiness_step = b.step("smoke-readiness", "Run ClickHouse-backed branch-readiness smoke scenarios");
     const readiness_scenarios = [_][]const u8{
-        "pool", "pool-loop", "timeout", "read-timeout", "write-timeout",
-        "compression", "insert-compression", "insert-zstd", "nested-compressed-insert",
-        "lowcardinality", "lc-write", "json", "dynamic", "parameters",
-        "geo", "external-data", "combined-features", "column-coverage",
+        "pool",          "pool-loop",          "timeout",         "read-timeout",             "write-timeout",
+        "compression",   "insert-compression", "insert-zstd",     "nested-compressed-insert", "lowcardinality",
+        "lc-write",      "json",               "dynamic",         "parameters",               "geo",
+        "external-data", "combined-features",  "column-coverage",
     };
     for (readiness_scenarios) |scenario| {
         const run_readiness_smoke = b.addRunArtifact(smoke);
         run_readiness_smoke.addArg(scenario);
         smoke_readiness_step.dependOn(&run_readiness_smoke.step);
     }
+
+    // Benchmarks against a live ClickHouse. Build with
+    // `-Doptimize=ReleaseFast`; see bench/plot.py for the SVG.
+    const bench_module = b.createModule(.{
+        .root_source_file = b.path("bench/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_module.addImport("clickzig", clickzig_module);
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_module,
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    run_bench.addPassthruArgs();
+    const bench_step = b.step("bench", "Run benchmarks against ClickHouse on 127.0.0.1:9000 (use -Doptimize=ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
 
     // --- Examples ---
     // Each example is its own runnable: `zig build run-01-connect`,
@@ -93,6 +125,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "03-observability", .path = "examples/03_observability.zig" },
         .{ .name = "04-health-check", .path = "examples/04_health_check.zig" },
         .{ .name = "05-custom-transport", .path = "examples/05_custom_transport.zig" },
+        .{ .name = "06-concurrent-queries", .path = "examples/06_concurrent_queries.zig" },
     };
     for (example_files) |ex| {
         const ex_module = b.createModule(.{

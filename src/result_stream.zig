@@ -4,7 +4,7 @@
 //! sees `EndOfStream` (or `Exception`, which terminates as well).
 //! Callers iterate:
 //!
-//!     var stream = try client.query("SELECT 1", arena.allocator(), null, .{});
+//!     var stream = try client.query("SELECT 1", arena.allocator(), .{});
 //!     while (try stream.next()) |packet| {
 //!         switch (packet) {
 //!             .data => |block| { ... },
@@ -19,6 +19,12 @@
 //! live; the stream sets it back to `.ready` (or `.broken` on error)
 //! when it sees the terminator packet or an Exception. Calling
 //! `next()` after that returns `null`.
+//!
+//! Cancellation: if the calling task is canceled (`std.Io`) while
+//! `next()` waits for the next packet, the stream asks the Client to
+//! send a protocol `Cancel` and drain the reply, then returns
+//! `error.Canceled` with the Client back at `.ready`. To stop consuming
+//! a result early without canceling the task, call `cancel()`.
 //!
 //! This file exceeds 100 lines because the packet-type dispatch is
 //! the central response loop and splitting it into per-packet helpers
@@ -114,13 +120,24 @@ pub const ResultStream = struct {
         is_broken: *bool,
         set_ready: *const fn (state: *anyopaque) void,
         set_broken: *const fn (state: *anyopaque) void,
+        /// Send `Cancel` and drain to the terminator. Returns true if
+        /// the connection is clean afterwards.
+        abort: *const fn (state: *anyopaque, allocator: std.mem.Allocator, compression: protocol.CompressionEnabled) bool,
     };
 
     pub fn next(self: *ResultStream) !?Packet {
         if (self.finished) return null;
+        // Packet ids are a single varint byte, so an error here means
+        // nothing of the next packet was consumed: the stream is at a
+        // clean boundary and a canceled query can be aborted in-band.
         const packet_id = wire.readServerPacketId(self.reader) catch |e| {
+            const mapped = self.mapReadError(e);
+            if (mapped == error.Canceled) {
+                self.abortOrBreak();
+                return error.Canceled;
+            }
             self.markBroken();
-            return self.mapReadError(e);
+            return mapped;
         };
         // Per upstream Connection::receivePacket: Data / Totals / Extremes
         // always ride through `maybe_compressed_in` when general
@@ -132,8 +149,7 @@ pub const ResultStream = struct {
         // are always uncompressed; encoding the gate now keeps a future
         // revision bump from silently hanging on the first Log packet.
         const compressed_body = self.compression == .Enable;
-        const compressed_log_or_pe = self.compression == .Enable
-            and self.server_revision >= protocol.Revision.WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS;
+        const compressed_log_or_pe = self.compression == .Enable and self.server_revision >= protocol.Revision.WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS;
         switch (packet_id) {
             .Data => return .{ .data = try self.readBlockAndCheck(compressed_body) },
             .Totals => return .{ .totals = try self.readBlockAndCheck(compressed_body) },
@@ -162,6 +178,28 @@ pub const ResultStream = struct {
         }
     }
 
+    /// Stop consuming this result early. Sends a protocol `Cancel` to the
+    /// server and drains whatever it still sends, so the parent Client
+    /// returns to `.ready` instead of staying `.busy`. No-op once the
+    /// stream has finished. Leaves the Client broken if the server does
+    /// not wind down within `Config.cancel_drain_timeout_ms`.
+    pub fn cancel(self: *ResultStream) void {
+        if (self.finished) return;
+        self.abortOrBreak();
+    }
+
+    fn abortOrBreak(self: *ResultStream) void {
+        const csv = self.client_state orelse {
+            self.finished = true;
+            return;
+        };
+        if (csv.abort(csv.state, self.allocator, self.compression)) {
+            self.markFinishedReady();
+        } else {
+            self.markBroken();
+        }
+    }
+
     fn readBlockAndCheck(self: *ResultStream, compressed_body: bool) !block_mod.Block {
         const mode: protocol.CompressionEnabled = if (compressed_body) .Enable else .Disable;
         // `table_name` rides UNCOMPRESSED on the wire (mirrors upstream
@@ -183,6 +221,7 @@ pub const ResultStream = struct {
             if (self.transport) |t| {
                 if (t.lastReadError()) |err| {
                     if (err == error.Timeout) return error.ReadTimeout;
+                    if (err == error.Canceled) return error.Canceled;
                 }
             }
         }
@@ -261,7 +300,7 @@ test "ResultStream surfaces a Data block then EndOfStream" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     // Data packet: ServerPacket.Data = 1, then a 1-col 1-row UInt8 block.
-    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.Data));
+    try varint.writeVarUInt(&w, @backingInt(protocol.ServerPacket.Data));
     try wire.writeStringBinary(&w, "");
     try varint.writeVarUInt(&w, 1);
     try w.writeByte(0);
@@ -275,7 +314,7 @@ test "ResultStream surfaces a Data block then EndOfStream" {
     try w.writeByte(0);
     try w.writeByte(7);
     // EndOfStream packet: id 5, no body
-    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.EndOfStream));
+    try varint.writeVarUInt(&w, @backingInt(protocol.ServerPacket.EndOfStream));
 
     var r: std.Io.Reader = .fixed(w.buffered());
     var stream: ResultStream = .{
@@ -299,7 +338,7 @@ test "ResultStream surfaces a Data block then EndOfStream" {
 test "ResultStream routes Exception terminator" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.Exception));
+    try varint.writeVarUInt(&w, @backingInt(protocol.ServerPacket.Exception));
     try w.writeInt(i32, 60, .little);
     try wire.writeStringBinary(&w, "DB::Exception");
     try wire.writeStringBinary(&w, "Table not found");
@@ -333,7 +372,7 @@ test "ResultStream with compression on reads table_name BEFORE the frame" {
     var w: std.Io.Writer = .fixed(&buf);
 
     // Server packet shape: packet_id Data + table_name "" + frame{ body }
-    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.Data));
+    try varint.writeVarUInt(&w, @backingInt(protocol.ServerPacket.Data));
     try wire.writeStringBinary(&w, ""); // uncompressed table_name
     // Build the body that goes inside the frame: BlockInfo + 0 cols + 0 rows.
     var body_buf: [32]u8 = undefined;
@@ -372,7 +411,7 @@ test "ResultStream compressed Data round-trips a 1-col 1-row block + asserts exa
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
 
-    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.Data));
+    try varint.writeVarUInt(&w, @backingInt(protocol.ServerPacket.Data));
     try wire.writeStringBinary(&w, "");
     var body_buf: [64]u8 = undefined;
     var bw: std.Io.Writer = .fixed(&body_buf);
@@ -418,7 +457,7 @@ test "ResultStream with compression on reads ProfileEvents UNCOMPRESSED below th
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
 
-    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.ProfileEvents));
+    try varint.writeVarUInt(&w, @backingInt(protocol.ServerPacket.ProfileEvents));
     // Uncompressed block body: table_name "" + BlockInfo + 0 cols + 0 rows
     try wire.writeStringBinary(&w, "");
     try varint.writeVarUInt(&w, 1);
@@ -455,7 +494,7 @@ test "ResultStream at revision >= 54_481 reads ProfileEvents COMPRESSED via the 
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
 
-    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.ProfileEvents));
+    try varint.writeVarUInt(&w, @backingInt(protocol.ServerPacket.ProfileEvents));
     try wire.writeStringBinary(&w, ""); // uncompressed table_name
     // Body: BlockInfo + 0 cols + 0 rows, written into the frame.
     var body_buf: [32]u8 = undefined;
@@ -487,7 +526,7 @@ test "ResultStream at revision >= 54_481 reads Log COMPRESSED via the gate" {
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
 
-    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.Log));
+    try varint.writeVarUInt(&w, @backingInt(protocol.ServerPacket.Log));
     try wire.writeStringBinary(&w, "");
     var body_buf: [32]u8 = undefined;
     var bw: std.Io.Writer = .fixed(&body_buf);

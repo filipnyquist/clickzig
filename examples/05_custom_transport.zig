@@ -45,8 +45,12 @@ const MemTransport = struct {
     fn cImpl(_: *anyopaque) void {}
     fn srtImpl(_: *anyopaque, _: ?u32) anyerror!void {}
     fn swtImpl(_: *anyopaque, _: ?u32) anyerror!void {}
-    fn lreImpl(_: *anyopaque) ?anyerror { return null; }
-    fn lweImpl(_: *anyopaque) ?anyerror { return null; }
+    fn lreImpl(_: *anyopaque) ?anyerror {
+        return null;
+    }
+    fn lweImpl(_: *anyopaque) ?anyerror {
+        return null;
+    }
 
     const vtable: clickzig.Transport.VTable = .{
         .reader = rImpl,
@@ -107,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
         .control_allocator = allocator,
         .read_buffer_size = 4096,
         .write_buffer_size = 4096,
-    }, std.Io.Threaded.global_single_threaded.io(), mem.transport(), null, null);
+    }, std.Io.Threaded.global_single_threaded.io(), mem.transport(), null);
     defer client.close();
 
     std.debug.print("handshake against canned bytes complete\n", .{});
